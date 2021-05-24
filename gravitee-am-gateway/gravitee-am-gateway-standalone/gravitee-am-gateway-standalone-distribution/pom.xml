@@ -291,6 +291,14 @@
 
         <dependency>
             <groupId>io.gravitee.am.gateway.handler</groupId>
+            <artifactId>gravitee-am-gateway-handler-account</artifactId>
+            <version>${project.version}</version>
+            <type>zip</type>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>io.gravitee.am.gateway.handler</groupId>
             <artifactId>gravitee-am-gateway-handler-saml2</artifactId>
             <version>${project.version}</version>
             <type>zip</type>
