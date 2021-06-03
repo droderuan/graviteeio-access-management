@@ -33,7 +33,7 @@ import io.vertx.reactivex.ext.web.handler.BodyHandler;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnitRunner;
 
 import static io.vertx.core.http.HttpHeaders.APPLICATION_X_WWW_FORM_URLENCODED;
 import static io.vertx.core.http.HttpHeaders.CONTENT_TYPE;
@@ -183,8 +183,7 @@ public class ForgotPasswordSubmissionEndpointTest extends RxWebTestBase {
         when(userService.forgotPassword(argThat(p -> p.getEmail().equals("email@test.com")), eq(client), any(User.class))).thenReturn(Completable.error(new EnforceUserIdentityException()));
 
         testRequest(
-                HttpMethod.POST, "/forgotPassword?client_id=client-id",
-                req -> postEmail(req, "email@test.com"),
+                HttpMethod.POST, "/forgotPassword?client_id=client-id",                req -> postEmail(req, "email@test.com"),
                 resp -> {
                     String location = resp.headers().get("location");
                     assertNotNull(location);
