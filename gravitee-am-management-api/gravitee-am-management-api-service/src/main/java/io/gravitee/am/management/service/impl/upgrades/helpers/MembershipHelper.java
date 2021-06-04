@@ -17,11 +17,17 @@ package io.gravitee.am.management.service.impl.upgrades.helpers;
 
 import io.gravitee.am.model.*;
 import io.gravitee.am.model.membership.MemberType;
+import io.gravitee.am.model.permissions.DefaultRole;
 import io.gravitee.am.model.permissions.SystemRole;
 import io.gravitee.am.repository.management.api.search.MembershipCriteria;
 import io.gravitee.am.service.MembershipService;
 import io.gravitee.am.service.RoleService;
+import io.reactivex.Flowable;
+import io.reactivex.Maybe;
 import org.springframework.stereotype.Component;
+
+import java.util.Arrays;
+import java.util.List;
 
 /**
  * @author Jeoffrey HAEYAERT (jeoffrey.haeyaert at graviteesource.com)
@@ -50,6 +56,13 @@ public class MembershipHelper {
         Role adminRole = roleService.findSystemRole(SystemRole.ORGANIZATION_PRIMARY_OWNER, ReferenceType.ORGANIZATION).blockingGet();
 
         setOrganizationRole(user, adminRole);
+    }
+
+    public void setOrganizationRole(User user, String role) {
+
+        Role defaultRole = roleService.findDefaultRole(Organization.DEFAULT, DefaultRole.fromName(role), ReferenceType.ORGANIZATION).blockingGet();
+
+        setOrganizationRole(user, defaultRole);
     }
 
     /**
@@ -94,6 +107,50 @@ public class MembershipHelper {
             membership.setReferenceId(Organization.DEFAULT);
 
             membershipService.addOrUpdate(Organization.DEFAULT, membership).blockingGet();
+        }
+    }
+
+
+    /**
+     * Helper method to reset organization role to the specified user using the specified organization role.
+     *
+     * @param user the user to define the role on.
+     * @param role the new user role
+     */
+    public void resetOrganizationRole(User user, String role) {
+
+        List<String> roleNames = Arrays.asList(
+                SystemRole.PLATFORM_ADMIN.name(),
+                SystemRole.ORGANIZATION_PRIMARY_OWNER.name(),
+                DefaultRole.ORGANIZATION_OWNER.name(),
+                DefaultRole.ORGANIZATION_USER.name());
+
+        List<String> organizationRoles = Flowable.merge(
+                roleService.findRolesByName(ReferenceType.PLATFORM, Platform.DEFAULT, ReferenceType.PLATFORM, roleNames),
+                roleService.findRolesByName(ReferenceType.PLATFORM, Platform.DEFAULT, ReferenceType.ORGANIZATION, roleNames),
+                roleService.findRolesByName(ReferenceType.ORGANIZATION, Organization.DEFAULT, ReferenceType.ORGANIZATION, roleNames))
+                .map(Role::getId)
+                .toList()
+                .blockingGet();
+
+        MembershipCriteria criteria = new MembershipCriteria();
+        criteria.setUserId(user.getId());
+
+        // search membership and delete them to assign the role defined into the configuration
+        Flowable.merge(
+                membershipService.findByCriteria(ReferenceType.PLATFORM, Platform.DEFAULT, criteria),
+                membershipService.findByCriteria(ReferenceType.ORGANIZATION, Organization.DEFAULT, criteria))
+                .filter(membership -> organizationRoles.contains(membership.getRoleId()))
+                .flatMapCompletable(membership -> membershipService.delete(membership.getId()))
+                .blockingGet();
+
+        switch (role) {
+            case "ORGANIZATION_PRIMARY_OWNER":
+                setOrganizationPrimaryOwnerRole(user);
+                break;
+            default:
+                setOrganizationRole(user, role);
+                break;
         }
     }
 }

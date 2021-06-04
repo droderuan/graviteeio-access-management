@@ -15,22 +15,28 @@
  */
 package io.gravitee.am.management.service.impl.upgrades;
 
+import io.gravitee.am.management.service.impl.upgrades.helpers.InlineOrganizationProviderConfiguration;
 import io.gravitee.am.management.service.impl.upgrades.helpers.MembershipHelper;
+import io.gravitee.am.management.service.impl.upgrades.helpers.OrganizationProviderConfiguration;
 import io.gravitee.am.model.*;
 import io.gravitee.am.model.common.Page;
 import io.gravitee.am.model.permissions.DefaultRole;
-import io.gravitee.am.model.permissions.SystemRole;
 import io.gravitee.am.service.*;
 import io.gravitee.am.service.model.NewIdentityProvider;
 import io.gravitee.am.service.model.PatchOrganization;
+import io.gravitee.am.service.model.UpdateIdentityProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.Ordered;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+import static io.gravitee.am.management.service.impl.upgrades.helpers.InlineOrganizationProviderConfiguration.INLINE_TYPE;
 
 /**
  * @author Jeoffrey HAEYAERT (jeoffrey.haeyaert at graviteesource.com)
@@ -42,8 +48,6 @@ public class DefaultOrganizationUpgrader implements Upgrader, Ordered {
     private static final Logger logger = LoggerFactory.getLogger(DefaultOrganizationUpgrader.class);
     private static final String ADMIN_DOMAIN = "admin";
     private static final int PAGE_SIZE = 10;
-    public static String ADMIN_USERNAME = "admin";
-    public static String DEFAULT_INLINE_IDP_CONFIG = "{\"users\":[{\"firstname\":\"Administrator\",\"lastname\":\"Administrator\",\"username\":\"" + ADMIN_USERNAME + "\",\"password\":\"adminadmin\"}]}";
 
     private final OrganizationService organizationService;
 
@@ -57,24 +61,31 @@ public class DefaultOrganizationUpgrader implements Upgrader, Ordered {
 
     private final DomainService domainService;
 
+    private final Environment environment;
+
     public DefaultOrganizationUpgrader(OrganizationService organizationService,
                                        IdentityProviderService identityProviderService,
                                        UserService userService,
                                        MembershipHelper membershipHelper,
                                        RoleService roleService,
-                                       DomainService domainService) {
+                                       DomainService domainService,
+                                       Environment environment) {
         this.organizationService = organizationService;
         this.identityProviderService = identityProviderService;
         this.userService = userService;
         this.membershipHelper = membershipHelper;
         this.roleService = roleService;
         this.domainService = domainService;
+        this.environment = environment;
     }
 
     @Override
     public boolean upgrade() {
 
         try {
+            // load all identity providers configured into the gravitee file
+            List<OrganizationProviderConfiguration> providerDefinitions = loadProviders();
+
             // This call create default organization with :
             // - default roles
             // - default entry point
@@ -108,41 +119,58 @@ public class DefaultOrganizationUpgrader implements Upgrader, Ordered {
                     // then delete the domain
                     domainService.delete(ADMIN_DOMAIN).blockingGet();
                 } else {
-                    // Need to create an inline provider and an admin user for this newly created default organization.
-                    IdentityProvider inlineProvider = createInlineProvider();
-                    User adminUser = createAdminUser(inlineProvider);
-                    membershipHelper.setOrganizationPrimaryOwnerRole(adminUser);
+
+                    // Need to create providers and users for this newly created default organization.
+                    List<String> providerIds = providerDefinitions.stream().map(providerDefinition -> {
+                        IdentityProvider provider = createProvider(providerDefinition);
+                        providerDefinition.upsertUsers(provider);
+                        return provider.getId();
+                    }).collect(Collectors.toList());
+
+                    logger.info("Associate providers to default organization");
+                    PatchOrganization patchOrganization = new PatchOrganization();
+                    patchOrganization.setIdentities(providerIds);
+                    organizationService.update(Organization.DEFAULT, patchOrganization, null).blockingGet();
                 }
-            }
+            } else {
+                // Perform this block only if the organization isn't a newly created one.
+                // Get organization with fresh data.
+                organization = organizationService.findById(Organization.DEFAULT).blockingGet();
+                logger.info("Check if default organization is up to date");
 
-            // Get organization with fresh data.
-            organization = organizationService.findById(Organization.DEFAULT).blockingGet();
+                // Need to check that inline idp and default admin user has 'admin' role.
+                final List<String> identities = organization.getIdentities();
 
-            logger.info("Check if default organization is up to date");
+                List<IdentityProvider> identityProviders = identityProviderService.findAll(ReferenceType.ORGANIZATION, Organization.DEFAULT).toList().blockingGet();
 
-            // Need to check that inline idp and default admin user has 'admin' role.
-            final List<String> identities = organization.getIdentities();
+                providerDefinitions.forEach(providerDefinition -> {
+                    Optional<IdentityProvider> filteredIdentity = identityProviders.stream()
+                            .filter(idp -> idp.getType().equals(providerDefinition.getType())
+                                    && !idp.isExternal()
+                                    && identities.contains(idp.getId())).findFirst();
 
-            IdentityProvider inlineIdp = identityProviderService.findAll(ReferenceType.ORGANIZATION, Organization.DEFAULT)
-                    .filter(identityProvider -> identityProvider.getType().equals("inline-am-idp")
-                            && !identityProvider.isExternal()
-                            && identities.contains(identityProvider.getId()))
-                    .firstElement().blockingGet();
+                    if (providerDefinition.isRefresh() && !providerDefinition.isExternal()) {
+                        if (filteredIdentity.isEmpty()) {
+                            logger.info("Provider '{}' missing from the default organization, create it", providerDefinition.getType());
+                            //  Refresh is required for a 'internal' Provider, create it
+                            IdentityProvider provider = createProvider(providerDefinition);
+                            providerDefinition.upsertUsers(provider);
 
-            // If inline idp doesn't exist or is not enabled, it is probably an administrator choice. So do not go further.
-            if (inlineIdp != null) {
-                // If inline idp doesn't have "admin" user in its configuration, it is probably an administrator choice. So do not go further.
-                if (inlineIdp.getConfiguration().contains(",\"username\":\"" + ADMIN_USERNAME + "\",") && inlineIdp.getRoleMapper().isEmpty()) {
-
-                    // Check the user admin exists.
-                    User adminUser = userService.findByUsernameAndSource(ReferenceType.ORGANIZATION, Organization.DEFAULT, ADMIN_USERNAME, inlineIdp.getId()).blockingGet();
-
-                    if (adminUser == null) {
-                        // Create the admin user with organization primary owner role on the default organization.
-                        adminUser = createAdminUser(inlineIdp);
-                        membershipHelper.setOrganizationPrimaryOwnerRole(adminUser);
+                            logger.info("Associate provider '{}' to default organization", providerDefinition.getType());
+                            PatchOrganization patchOrganization = new PatchOrganization();
+                            identities.add(provider.getId());
+                            patchOrganization.setIdentities(identities);
+                            organizationService.update(Organization.DEFAULT, patchOrganization, null).blockingGet();
+                        } else if (filteredIdentity.get().getRoleMapper() == null || filteredIdentity.get().getRoleMapper().isEmpty()) {
+                            logger.info("Provider '{}' exists for the default organization, update users", providerDefinition.getType());
+                            // update user definition if there are no role mapper on Idp
+                            updateProvider(providerDefinition, filteredIdentity.get());
+                            providerDefinition.upsertUsers(filteredIdentity.get());
+                        } else {
+                            logger.info("Provider '{}' exists for the default organization, update users ignored due to definition of RoleMapper", providerDefinition.getType());
+                        }
                     }
-                }
+                });
             }
 
             // The primary owner of the default organization must be considered as platform admin.
@@ -155,38 +183,58 @@ public class DefaultOrganizationUpgrader implements Upgrader, Ordered {
         return true;
     }
 
-    private IdentityProvider createInlineProvider() {
+    private List<OrganizationProviderConfiguration> loadProviders(){
+        List<OrganizationProviderConfiguration> providers = new ArrayList<>();
+        boolean found = true;
+        int idx = 0;
+
+        while (found) {
+            String type = environment.getProperty("security.providers[" + idx + "].type");
+            found = (type != null);
+            if (found) {
+                switch (type) {
+                    case INLINE_TYPE:
+                        providers.add(new InlineOrganizationProviderConfiguration(environment, idx, this.userService, this.membershipHelper));
+                        break;
+                    default:
+                        logger.warn("Unsupported provider with type '{}'", type);
+                }
+            }
+            idx++;
+        }
+
+        return providers;
+    }
+
+    private IdentityProvider createProvider(OrganizationProviderConfiguration config) {
         // Create an inline identity provider
-        logger.info("Create an user-inline provider");
+        logger.info("Create a new provider with type {}", config.getType());
         NewIdentityProvider adminIdentityProvider = new NewIdentityProvider();
-        adminIdentityProvider.setType("inline-am-idp");
-        adminIdentityProvider.setName("Inline users");
-        adminIdentityProvider.setConfiguration(DEFAULT_INLINE_IDP_CONFIG);
+        adminIdentityProvider.setType(config.getType());
+        adminIdentityProvider.setName(config.getName());
+
+        adminIdentityProvider.setConfiguration(config.generateConfiguration());
 
         IdentityProvider createdIdentityProvider = identityProviderService.create(ReferenceType.ORGANIZATION, Organization.DEFAULT, adminIdentityProvider, null).blockingGet();
-
-        logger.info("Associate user-inline provider to default organization");
-        PatchOrganization patchOrganization = new PatchOrganization();
-        patchOrganization.setIdentities(Collections.singletonList(createdIdentityProvider.getId()));
-        organizationService.update(Organization.DEFAULT, patchOrganization, null).blockingGet();
-
         return createdIdentityProvider;
     }
 
-    private User createAdminUser(IdentityProvider inlineIdp) {
+    private IdentityProvider updateProvider(OrganizationProviderConfiguration config, IdentityProvider existingProvider) {
+        // Create an inline identity provider
+        logger.info("Update provider with type {} and id {}", config.getType(), existingProvider.getId());
+        UpdateIdentityProvider updatedIdentityProvider = new UpdateIdentityProvider();
+        updatedIdentityProvider.setName(config.getName());
+        updatedIdentityProvider.setMappers(existingProvider.getMappers());
+        updatedIdentityProvider.setRoleMapper(existingProvider.getRoleMapper());
 
-        final User newUser = new User();
-        newUser.setInternal(false);
-        newUser.setUsername(ADMIN_USERNAME);
-        newUser.setSource(inlineIdp.getId());
-        newUser.setReferenceType(ReferenceType.ORGANIZATION);
-        newUser.setReferenceId(Organization.DEFAULT);
+        updatedIdentityProvider.setConfiguration(config.mergeConfiguration(existingProvider.getConfiguration()));
 
-        return userService.create(newUser).blockingGet();
+        return identityProviderService.update(ReferenceType.ORGANIZATION, Organization.DEFAULT, existingProvider.getId(), updatedIdentityProvider, null).blockingGet();
     }
 
     @Override
     public int getOrder() {
         return 2;
     }
+
 }

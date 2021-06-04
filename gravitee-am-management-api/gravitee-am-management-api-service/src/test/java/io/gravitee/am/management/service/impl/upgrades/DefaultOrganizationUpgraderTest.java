@@ -23,6 +23,7 @@ import io.gravitee.am.repository.exceptions.TechnicalException;
 import io.gravitee.am.service.*;
 import io.gravitee.am.service.model.NewIdentityProvider;
 import io.gravitee.am.service.model.PatchOrganization;
+import io.gravitee.am.service.model.UpdateIdentityProvider;
 import io.reactivex.Completable;
 import io.reactivex.Flowable;
 import io.reactivex.Maybe;
@@ -31,7 +32,10 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
+import org.mockito.Spy;
 import org.mockito.runners.MockitoJUnitRunner;
+import org.springframework.core.env.Environment;
+import org.springframework.core.env.StandardEnvironment;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -51,6 +55,8 @@ import static org.mockito.Mockito.*;
  */
 @RunWith(MockitoJUnitRunner.class)
 public class DefaultOrganizationUpgraderTest {
+    public static final String ADMIN_USERNAME = "admin";
+    public static String DEFAULT_INLINE_IDP_CONFIG = "{\"users\":[{\"firstname\":\"Administrator\",\"lastname\":\"Administrator\",\"username\":\"" + ADMIN_USERNAME + "\",\"password\":\"adminadmin\"}]}";
 
     @Mock
     private OrganizationService organizationService;
@@ -70,12 +76,29 @@ public class DefaultOrganizationUpgraderTest {
     @Mock
     private DomainService domainService;
 
+    @Spy
+    private Environment environment = new StandardEnvironment();
+
     private DefaultOrganizationUpgrader cut;
 
     @Before
     public void before() {
+        cut = new DefaultOrganizationUpgrader(organizationService, identityProviderService, userService, membershipHelper, roleService, domainService, environment);
+        defineDefaultSecurityConfig();
+    }
 
-        cut = new DefaultOrganizationUpgrader(organizationService, identityProviderService, userService, membershipHelper, roleService, domainService);
+    private void defineDefaultSecurityConfig() {
+        defineDefaultSecurityConfig(false);
+    }
+
+    private void defineDefaultSecurityConfig(boolean refresh) {
+        reset(environment);
+        doReturn("inline-am-idp").when(environment).getProperty("security.providers[0].type");
+        doReturn("none").when(environment).getProperty(eq("security.providers[0].password-encoding-algo"), any(), any());
+        doReturn(ADMIN_USERNAME).when(environment).getProperty("security.providers[0].users[0].username");
+        doReturn("adminadmin").when(environment).getProperty("security.providers[0].users[0].password");
+        doReturn("ORGANIZATION_PRIMARY_OWNER").when(environment).getProperty("security.providers[0].users[0].role");
+        doReturn(refresh).when(environment).getProperty("security.providers[0].refresh", boolean.class, false);
     }
 
     @Test
@@ -89,6 +112,7 @@ public class DefaultOrganizationUpgraderTest {
 
         final Organization organization = new Organization();
         when(organizationService.createDefault()).thenReturn(Maybe.just(organization));
+        when(userService.findByUsernameAndSource(ReferenceType.ORGANIZATION, Organization.DEFAULT, "admin", idp.getId())).thenReturn(Maybe.empty());
         when(identityProviderService.create(eq(ReferenceType.ORGANIZATION), eq(Organization.DEFAULT), any(NewIdentityProvider.class), isNull())).thenReturn(Single.just(idp));
         when(organizationService.update(eq(Organization.DEFAULT), any(PatchOrganization.class), isNull())).thenReturn(Single.just(organization));
         when(userService.create(argThat(user -> !user.isInternal()
@@ -98,16 +122,13 @@ public class DefaultOrganizationUpgraderTest {
                 && user.getReferenceId().equals(Organization.DEFAULT)))).thenReturn(Single.just(adminUser));
         when(domainService.findById("admin")).thenReturn(Maybe.empty());
         doNothing().when(membershipHelper).setOrganizationPrimaryOwnerRole(argThat(user -> user.getId().equals(adminUser.getId())));
-        when(organizationService.findById(Organization.DEFAULT)).thenReturn(Single.just(organization));
-        when(identityProviderService.findAll(ReferenceType.ORGANIZATION, Organization.DEFAULT)).thenReturn(Flowable.empty());
 
         assertTrue(cut.upgrade());
         verify(membershipHelper, times(1)).setPlatformAdminRole();
     }
 
     @Test
-    public void shouldNotUpdateIdentityProviderRoleMapper_noInlineIdp() {
-
+    public void shouldNotUpdateIdentityProvider_noInlineIdp_refreshFalse() {
         IdentityProvider idp = new IdentityProvider();
         idp.setId("test");
         idp.setType("idpType");
@@ -122,11 +143,47 @@ public class DefaultOrganizationUpgraderTest {
         when(organizationService.createDefault()).thenReturn(Maybe.empty());
         assertTrue(cut.upgrade());
         verify(membershipHelper, times(1)).setPlatformAdminRole();
+        verify(identityProviderService, never()).update(any(), eq(Organization.DEFAULT), any(), any(UpdateIdentityProvider.class), isNull());
+        verify(userService, never()).create(any());
+        verify(userService, never()).update(any(), any(), any(), any());
+        verify(membershipHelper, never()).setOrganizationPrimaryOwnerRole(argThat(u -> u.getUsername().equals(ADMIN_USERNAME)));
+        verify(membershipHelper, never()).resetOrganizationRole(any(), any());
     }
 
     @Test
-    public void shouldNotUpdateIdentityProviderRoleMapper_adminUserRemoved() {
+    public void shouldUpdateIdentityProvider_noInlineIdp_refreshTrue() {
+        defineDefaultSecurityConfig(true);
 
+        IdentityProvider idp = new IdentityProvider();
+        idp.setId("test");
+        idp.setType("inline-am-idp");
+        idp.setExternal(false);
+        idp.setConfiguration(DEFAULT_INLINE_IDP_CONFIG);
+
+        Organization defaultOrganization = new Organization();
+        defaultOrganization.setId(Organization.DEFAULT);
+        defaultOrganization.setIdentities(Arrays.asList("test"));
+
+        when(organizationService.findById(Organization.DEFAULT)).thenReturn(Single.just(defaultOrganization));
+        when(identityProviderService.findAll(ReferenceType.ORGANIZATION, Organization.DEFAULT)).thenReturn(Flowable.just(idp));
+        when(identityProviderService.update(any(), eq(Organization.DEFAULT), any(), any(UpdateIdentityProvider.class), isNull())).thenReturn(Single.just(idp));
+        User item = new User();
+        item.setId("uid");
+        when(userService.findByUsernameAndSource(any(), any(), any(), any())).thenReturn(Maybe.just(item));
+
+        when(organizationService.createDefault()).thenReturn(Maybe.empty());
+
+        assertTrue(cut.upgrade());
+
+        verify(membershipHelper, times(1)).setPlatformAdminRole();
+        verify(identityProviderService, times(1)).update(any(), eq(Organization.DEFAULT), any(), any(UpdateIdentityProvider.class), isNull());
+        verify(userService, never()).create(any());
+        verify(membershipHelper, never()).setOrganizationPrimaryOwnerRole(argThat(u -> u.getUsername().equals(ADMIN_USERNAME)));
+        verify(membershipHelper, times(1)).resetOrganizationRole(any(), any());
+    }
+
+    @Test
+    public void shouldNotUpdateIdentityProviderRoleMapper_adminUserRemoved_refreshFalse() {
         IdentityProvider idp = new IdentityProvider();
         idp.setId("inlineIdpId");
         idp.setType("inline-am-idp");
@@ -144,16 +201,22 @@ public class DefaultOrganizationUpgraderTest {
         when(organizationService.createDefault()).thenReturn(Maybe.empty());
         assertTrue(cut.upgrade());
         verify(membershipHelper, times(1)).setPlatformAdminRole();
+        verify(identityProviderService, never()).update(any(), eq(Organization.DEFAULT), any(), any(UpdateIdentityProvider.class), isNull());
+        verify(userService, never()).create(any());
+        verify(userService, never()).update(any(), any(), any(), any());
+        verify(membershipHelper, never()).setOrganizationPrimaryOwnerRole(argThat(u -> u.getUsername().equals(ADMIN_USERNAME)));
+        verify(membershipHelper, never()).resetOrganizationRole(any(), any());
     }
 
     @Test
-    public void shouldNotUpdateIdentityProviderRoleMapper_roleMapperIsAlreadySet() {
+    public void shouldNotUpdateIdentityProviderRoleMapper_roleMapperIsAlreadySet_refreshTrue() {
+        defineDefaultSecurityConfig(true);
 
         IdentityProvider idp = new IdentityProvider();
         idp.setId("inlineIdpId");
         idp.setType("inline-am-idp");
         idp.setExternal(false);
-        idp.setConfiguration(DefaultOrganizationUpgrader.DEFAULT_INLINE_IDP_CONFIG);
+        idp.setConfiguration(DEFAULT_INLINE_IDP_CONFIG);
         idp.setRoleMapper(Collections.singletonMap("role1", new String[]{"username=test"})); // RoleMapper already set.
 
         final Role adminRole = new Role();
@@ -169,16 +232,89 @@ public class DefaultOrganizationUpgraderTest {
         when(organizationService.createDefault()).thenReturn(Maybe.empty());
         assertTrue(cut.upgrade());
         verify(membershipHelper, times(1)).setPlatformAdminRole();
+
+        verify(identityProviderService, never()).update(any(), eq(Organization.DEFAULT), any(), any(UpdateIdentityProvider.class), isNull());
+        verify(userService, never()).create(any());
+        verify(userService, never()).update(any(), any(), any(), any());
+        verify(membershipHelper, never()).setOrganizationPrimaryOwnerRole(argThat(u -> u.getUsername().equals(ADMIN_USERNAME)));
+        verify(membershipHelper, never()).resetOrganizationRole(any(), any());
     }
 
     @Test
-    public void shouldCreateAdminUser_noAdminUser() {
+    public void shouldCreateAdminUser_noAdminUser_refreshTrue() {
+        defineDefaultSecurityConfig(true);
 
         IdentityProvider idp = new IdentityProvider();
         idp.setId("inlineIdpId");
         idp.setType("inline-am-idp");
         idp.setExternal(false);
-        idp.setConfiguration(DefaultOrganizationUpgrader.DEFAULT_INLINE_IDP_CONFIG);
+        idp.setConfiguration(DEFAULT_INLINE_IDP_CONFIG);
+        idp.setRoleMapper(new HashMap<>());
+
+        User adminUser = new User();
+        adminUser.setId("admin-id");
+        adminUser.setUsername(ADMIN_USERNAME);
+
+        Organization defaultOrganization = new Organization();
+        defaultOrganization.setId(Organization.DEFAULT);
+        defaultOrganization.setIdentities(Arrays.asList("inlineIdpId"));
+
+        when(organizationService.findById(Organization.DEFAULT)).thenReturn(Single.just(defaultOrganization));
+        when(identityProviderService.findAll(ReferenceType.ORGANIZATION, Organization.DEFAULT)).thenReturn(Flowable.just(idp));
+        when(identityProviderService.update(any(), eq(Organization.DEFAULT), any(), any(UpdateIdentityProvider.class), isNull())).thenReturn(Single.just(idp));
+
+        when(userService.findByUsernameAndSource(eq(ReferenceType.ORGANIZATION), eq(Organization.DEFAULT), eq(ADMIN_USERNAME), any())).thenReturn(Maybe.empty());
+        when(userService.create(any())).thenReturn(Single.just(adminUser));
+
+        when(organizationService.createDefault()).thenReturn(Maybe.empty());
+        assertTrue(cut.upgrade());
+        verify(identityProviderService, times(1)).update(any(), eq(Organization.DEFAULT), any(), any(UpdateIdentityProvider.class), isNull());
+        verify(membershipHelper, times(1)).setOrganizationPrimaryOwnerRole(argThat(u -> u.getUsername().equals(ADMIN_USERNAME)));
+        verify(membershipHelper, never()).resetOrganizationRole(any(), any());
+        verify(membershipHelper, times(1)).setPlatformAdminRole();
+        verify(userService, times(1)).create(any());
+        verify(userService, never()).update(any(), any(), any(), any());
+    }
+
+    @Test
+    public void shouldNotCreateAdminUser_noAdminUser_refreshFalse() {
+        IdentityProvider idp = new IdentityProvider();
+        idp.setId("inlineIdpId");
+        idp.setType("inline-am-idp");
+        idp.setExternal(false);
+        idp.setConfiguration(DEFAULT_INLINE_IDP_CONFIG);
+        idp.setRoleMapper(new HashMap<>());
+
+        User adminUser = new User();
+        adminUser.setId("admin-id");
+        adminUser.setUsername(ADMIN_USERNAME);
+
+        Organization defaultOrganization = new Organization();
+        defaultOrganization.setId(Organization.DEFAULT);
+        defaultOrganization.setIdentities(Arrays.asList("inlineIdpId"));
+
+        when(organizationService.findById(Organization.DEFAULT)).thenReturn(Single.just(defaultOrganization));
+        when(identityProviderService.findAll(ReferenceType.ORGANIZATION, Organization.DEFAULT)).thenReturn(Flowable.just(idp));
+
+        when(organizationService.createDefault()).thenReturn(Maybe.empty());
+        assertTrue(cut.upgrade());
+        verify(identityProviderService, never()).update(any(), eq(Organization.DEFAULT), any(), any(UpdateIdentityProvider.class), isNull());
+        verify(userService, never()).create(any());
+        verify(userService, never()).update(any(), any(), any(), any());
+        verify(membershipHelper, never()).setOrganizationPrimaryOwnerRole(argThat(u -> u.getUsername().equals(ADMIN_USERNAME)));
+        verify(membershipHelper, never()).resetOrganizationRole(any(), any());
+        verify(membershipHelper, times(1)).setPlatformAdminRole();
+    }
+
+    @Test
+    public void shouldUpdateAdminUser_refreshTrue() {
+        defineDefaultSecurityConfig(true);
+
+        IdentityProvider idp = new IdentityProvider();
+        idp.setId("inlineIdpId");
+        idp.setType("inline-am-idp");
+        idp.setExternal(false);
+        idp.setConfiguration(DEFAULT_INLINE_IDP_CONFIG);
         idp.setRoleMapper(new HashMap<>());
 
         User adminUser = new User();
@@ -190,13 +326,17 @@ public class DefaultOrganizationUpgraderTest {
 
         when(organizationService.findById(Organization.DEFAULT)).thenReturn(Single.just(defaultOrganization));
         when(identityProviderService.findAll(ReferenceType.ORGANIZATION, Organization.DEFAULT)).thenReturn(Flowable.just(idp));
-        when(userService.findByUsernameAndSource(ReferenceType.ORGANIZATION, Organization.DEFAULT, "admin", idp.getId())).thenReturn(Maybe.empty());
-        when(userService.create(any(User.class))).thenReturn(Single.just(adminUser));
-        doNothing().when(membershipHelper).setOrganizationPrimaryOwnerRole(argThat(user -> user.getId().equals(adminUser.getId())));
+        when(identityProviderService.update(any(), eq(Organization.DEFAULT), any(), any(UpdateIdentityProvider.class), isNull())).thenReturn(Single.just(idp));
+
+        when(userService.findByUsernameAndSource(eq(ReferenceType.ORGANIZATION), eq(Organization.DEFAULT), eq(ADMIN_USERNAME), any())).thenReturn(Maybe.just(adminUser));
 
         when(organizationService.createDefault()).thenReturn(Maybe.empty());
         assertTrue(cut.upgrade());
+        verify(identityProviderService, times(1)).update(any(), eq(Organization.DEFAULT), any(), any(UpdateIdentityProvider.class), isNull());
+        verify(membershipHelper, times(1)).resetOrganizationRole(any(), any());
         verify(membershipHelper, times(1)).setPlatformAdminRole();
+        verify(userService, never()).create(any());
+        verify(membershipHelper, never()).setOrganizationPrimaryOwnerRole(argThat(u -> u.getUsername().equals(ADMIN_USERNAME)));
     }
 
     @Test
@@ -206,7 +346,7 @@ public class DefaultOrganizationUpgraderTest {
         idp.setId("inlineIdpId");
         idp.setType("inline-am-idp");
         idp.setExternal(false);
-        idp.setConfiguration(DefaultOrganizationUpgrader.DEFAULT_INLINE_IDP_CONFIG);
+        idp.setConfiguration(DEFAULT_INLINE_IDP_CONFIG);
         idp.setRoleMapper(new HashMap<>());
 
         User adminUser = new User();
@@ -221,7 +361,6 @@ public class DefaultOrganizationUpgraderTest {
 
         when(organizationService.findById(Organization.DEFAULT)).thenReturn(Single.just(defaultOrganization));
         when(identityProviderService.findAll(ReferenceType.ORGANIZATION, Organization.DEFAULT)).thenReturn(Flowable.just(idp));
-        when(userService.findByUsernameAndSource(ReferenceType.ORGANIZATION, Organization.DEFAULT, "admin", idp.getId())).thenReturn(Maybe.just(adminUser)); // Admin already exists.
         when(organizationService.createDefault()).thenReturn(Maybe.empty());
 
         assertTrue(cut.upgrade());
@@ -271,9 +410,6 @@ public class DefaultOrganizationUpgraderTest {
                 .thenReturn(Single.just(new Page<>(Arrays.asList(user, user), 2, totalUsers)));
 
         doNothing().when(membershipHelper).setOrganizationRole(eq(user), eq(adminRole));
-
-        when(organizationService.findById(Organization.DEFAULT)).thenReturn(Single.just(organization));
-        when(identityProviderService.findAll(ReferenceType.ORGANIZATION, Organization.DEFAULT)).thenReturn(Flowable.empty());
 
         cut.upgrade();
 
